@@ -41,7 +41,7 @@ impl ResolveError {
 
 pub unsafe trait Factory {
     fn type_name(&self) -> &'static str;
-    fn type_id(&self) -> TypeId;
+    fn result_type_id(&self) -> TypeId;
     fn resolve(
         self: Box<Self>,
         service_provider: &ServiceProvider,
@@ -55,7 +55,7 @@ where
     fn type_name(&self) -> &'static str {
         type_name::<T>()
     }
-    fn type_id(&self) -> TypeId {
+    fn result_type_id(&self) -> TypeId {
         // Safety: the generics enforce that resolve returns a Box<T>
         TypeId::of::<T>()
     }
@@ -95,10 +95,7 @@ impl ServiceProvider {
             factories: RefCell::new(
                 factories
                     .into_iter()
-                    .map(|f| {
-                        eprintln!("Factory: {0} - {1:?}", f.type_name(), f.type_id());
-                        (f.type_id(), f)
-                    })
+                    .map(|f| (f.result_type_id(), f))
                     .collect(),
             ),
             instances: FrozenMap::new(),
@@ -106,8 +103,6 @@ impl ServiceProvider {
     }
 
     pub fn resolve<T: 'static>(&self) -> Result<Rc<T>, ResolveError> {
-        eprintln!("Resolve {0} in {1:?}", type_name::<T>(), self);
-
         let type_id = TypeId::of::<T>();
 
         if let Some(any) = self.instances.get(&type_id).cloned() {
@@ -148,7 +143,7 @@ mod test {
     }
 
     impl Test1 {
-        fn factory(services: &ServiceProvider) -> Result<Test1, Box<dyn Error>> {
+        fn factory(_services: &ServiceProvider) -> Result<Test1, Box<dyn Error>> {
             Ok(Test1 {
                 name: String::from("Lila"),
             })
@@ -177,12 +172,23 @@ mod test {
     }
 
     #[test]
-    fn resolve() -> Result<(), Box<dyn Error>> {
+    fn resolve_test1() -> Result<(), Box<dyn Error>> {
         let services = service_provider();
 
         let test1 = services.resolve::<Test1>()?;
 
         assert_eq!(test1.name, "Lila");
+
+        Ok(())
+    }
+    #[test]
+    fn resolve_test2() -> Result<(), Box<dyn Error>> {
+        let services = service_provider();
+
+        let test2 = services.resolve::<Test2>()?;
+
+        assert_eq!(test2.name, "Kuh");
+        assert_eq!(test2.test1.name, "Lila");
 
         Ok(())
     }
