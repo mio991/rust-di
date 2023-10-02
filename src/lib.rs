@@ -1,145 +1,189 @@
 use std::{
     any::{type_name, Any, TypeId},
+    cell::RefCell,
     collections::HashMap,
+    error::Error,
     fmt::Debug,
-    marker::PhantomData,
-    mem::replace,
+    rc::Rc,
 };
 
-#[derive(Debug)]
-pub enum ResolveError {
+use elsa::FrozenMap;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ResolveErrorKind {
+    #[error("Service not found!")]
     NotFound,
+    #[error("Circular reference while resolving!")]
     CircularReferenceFound,
-    TypeMissmatch(&'static str),
+    #[error("Error while resolving service!")]
+    ErrorWhileResolving(
+        #[from]
+        #[source]
+        Box<dyn Error>,
+    ),
 }
 
-impl From<std::cell::BorrowMutError> for ResolveError {
-    fn from(_value: std::cell::BorrowMutError) -> Self {
-        Self::CircularReferenceFound
+#[derive(Debug, thiserror::Error)]
+#[error("Could not resolve {type_name} because '{kind}'!")]
+pub struct ResolveError {
+    type_name: &'static str,
+    kind: ResolveErrorKind,
+}
+
+impl ResolveError {
+    fn for_type<T: 'static>() -> fn(ResolveErrorKind) -> ResolveError {
+        |kind| ResolveError {
+            type_name: type_name::<T>(),
+            kind,
+        }
     }
 }
 
-pub trait ServiceProvider {
-    fn resolve_by_id(&mut self, type_id: TypeId) -> Result<&Variant, ResolveError>;
+pub unsafe trait Factory {
+    fn type_name(&self) -> &'static str;
+    fn type_id(&self) -> TypeId;
+    fn resolve(
+        self: Box<Self>,
+        service_provider: &ServiceProvider,
+    ) -> Result<Rc<dyn Any>, Box<dyn Error>>;
 }
 
-impl dyn ServiceProvider {
-    pub fn resolve<T: 'static>(&mut self) -> Result<&T, ResolveError> {
-        let type_id = TypeId::of::<T>();
-        let variant = self.resolve_by_id(type_id)?;
-
-        variant
-            .value
-            .downcast_ref()
-            .ok_or(ResolveError::TypeMissmatch(variant.type_name))
-    }
-}
-
-pub struct Variant {
-    pub type_name: &'static str,
-    pub value: Box<dyn Any>,
-}
-
-enum MapEntry {
-    Unresolved(Box<dyn Fn(&dyn ServiceProvider) -> Variant>),
-    Resolving,
-    Resolved(Variant),
-}
-
-impl Debug for MapEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            MapEntry::Unresolved(_) => "Unresolved",
-            MapEntry::Resolving => "Resolving",
-            MapEntry::Resolved(_) => "Resolved",
-        })
-    }
-}
-
-#[derive(Debug)]
-pub struct ServiceCollection {
-    map: HashMap<TypeId, MapEntry>,
-}
-
-fn make_box_factory<T, F>(factory: F) -> Box<dyn Fn(&dyn ServiceProvider) -> Variant>
+unsafe impl<T: Any + 'static, F> Factory for F
 where
-    T: 'static,
-    F: Fn(&dyn ServiceProvider) -> T + 'static,
+    F: FnOnce(&ServiceProvider) -> Result<T, Box<dyn Error>>,
 {
-    Box::new(move |services| Variant {
-        type_name: type_name::<T>(),
-        value: Box::new(factory(services)),
-    })
+    fn type_name(&self) -> &'static str {
+        type_name::<T>()
+    }
+    fn type_id(&self) -> TypeId {
+        // Safety: the generics enforce that resolve returns a Box<T>
+        TypeId::of::<T>()
+    }
+
+    fn resolve(
+        self: Box<Self>,
+        service_provider: &ServiceProvider,
+    ) -> Result<Rc<dyn Any>, Box<dyn Error>> {
+        let service = self(service_provider)?;
+
+        Ok(Rc::new(service))
+    }
 }
 
-impl ServiceCollection {
-    pub fn new() -> Self {
+impl Debug for dyn Factory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("Factory for {0}", self.type_name()))
+    }
+}
+
+pub struct ServiceProvider {
+    factories: RefCell<HashMap<TypeId, Box<dyn Factory>>>,
+    instances: FrozenMap<TypeId, Box<Rc<dyn Any>>>,
+}
+
+impl Debug for ServiceProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceProvider")
+            .field("factories", &self.factories)
+            .finish()
+    }
+}
+
+impl ServiceProvider {
+    pub fn new<I: IntoIterator<Item = Box<dyn Factory>>>(factories: I) -> Self {
         Self {
-            map: HashMap::new(),
+            factories: RefCell::new(
+                factories
+                    .into_iter()
+                    .map(|f| {
+                        eprintln!("Factory: {0} - {1:?}", f.type_name(), f.type_id());
+                        (f.type_id(), f)
+                    })
+                    .collect(),
+            ),
+            instances: FrozenMap::new(),
         }
     }
 
-    pub fn add<T>(&mut self) -> ProviderBuilder<'_, T>
-    where
-        T: 'static,
-    {
-        ProviderBuilder {
-            map: &mut self.map,
-            phantom: PhantomData::default(),
+    pub fn resolve<T: 'static>(&self) -> Result<Rc<T>, ResolveError> {
+        eprintln!("Resolve {0} in {1:?}", type_name::<T>(), self);
+
+        let type_id = TypeId::of::<T>();
+
+        if let Some(any) = self.instances.get(&type_id).cloned() {
+            Ok(any
+                .downcast()
+                .expect("we resolved by TypeId so it should be a T"))
+        } else {
+            let factory = {
+                let mut factories = self.factories.borrow_mut();
+                factories
+                    .remove(&type_id)
+                    .ok_or(ResolveErrorKind::NotFound)
+                    .map_err(ResolveError::for_type::<T>())?
+            };
+
+            let service = factory
+                .resolve(self)
+                .map_err(ResolveErrorKind::ErrorWhileResolving)
+                .map_err(ResolveError::for_type::<T>())?;
+
+            self.instances.insert(type_id, Box::new(service.clone()));
+
+            Ok(service
+                .downcast()
+                .expect("We just resolved the factory for T"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    #[allow(unused_variables)]
+    use super::*;
+    use std::{error::Error, rc::Rc};
+
+    struct Test1 {
+        name: String,
+    }
+
+    impl Test1 {
+        fn factory(services: &ServiceProvider) -> Result<Test1, Box<dyn Error>> {
+            Ok(Test1 {
+                name: String::from("Lila"),
+            })
         }
     }
 
-    pub fn build(self) -> Box<dyn ServiceProvider> {
-        Box::new(self.map)
-    }
-}
-
-pub struct ProviderBuilder<'a, T: 'static> {
-    map: &'a mut HashMap<TypeId, MapEntry>,
-    phantom: PhantomData<T>,
-}
-
-impl<'a, T: 'static> ProviderBuilder<'a, T> {
-    pub fn with_factory<F>(self, factory: F)
-    where
-        F: Fn(&dyn ServiceProvider) -> T + 'static,
-    {
-        self.map.insert(
-            TypeId::of::<T>(),
-            MapEntry::Unresolved(make_box_factory(factory)),
-        );
+    struct Test2 {
+        name: String,
+        test1: Rc<Test1>,
     }
 
-    pub fn with_instance(self, service: T) {
-        self.map.insert(
-            TypeId::of::<T>(),
-            MapEntry::Resolved(Variant {
-                type_name: type_name::<T>(),
-                value: Box::new(service),
-            }),
-        );
-    }
-}
-
-impl ServiceProvider for HashMap<TypeId, MapEntry> {
-    fn resolve_by_id(&mut self, type_id: TypeId) -> Result<&Variant, ResolveError> {
-        let current = {
-            let entry = self.get_mut(&type_id).ok_or(ResolveError::NotFound)?;
-
-            replace(entry, MapEntry::Resolving)
-        };
-
-        let service = match current {
-            MapEntry::Unresolved(factory) => Ok(factory(self)),
-            MapEntry::Resolving => Err(ResolveError::CircularReferenceFound),
-            MapEntry::Resolved(service) => Ok(service),
-        }?;
-
-        *self.get_mut(&type_id).expect("just accessed it!") = MapEntry::Resolved(service);
-
-        match self.get(&type_id).expect("just accessed it!") {
-            MapEntry::Resolved(service) => Ok(service),
-            _ => panic!("Expected self to be resolved!"),
+    impl Test2 {
+        fn factory(services: &ServiceProvider) -> Result<Test2, Box<dyn Error>> {
+            Ok(Test2 {
+                name: String::from("Kuh"),
+                test1: services.resolve()?,
+            })
         }
+    }
+
+    fn service_provider() -> ServiceProvider {
+        let factories: Vec<Box<dyn Factory>> =
+            vec![Box::new(Test1::factory), Box::new(Test2::factory)];
+
+        ServiceProvider::new(factories)
+    }
+
+    #[test]
+    fn resolve() -> Result<(), Box<dyn Error>> {
+        let services = service_provider();
+
+        let test1 = services.resolve::<Test1>()?;
+
+        assert_eq!(test1.name, "Lila");
+
+        Ok(())
     }
 }
